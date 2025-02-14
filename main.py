@@ -1,5 +1,5 @@
 import os
-#os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 from typing import List
 from tqdm import tqdm
 import fire
@@ -8,7 +8,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, Ll
 from peft import (
     LoraConfig,
     get_peft_model,
-    prepare_model_for_int8_training,
+    prepare_model_for_kbit_training,
     PeftModel,
     AdaLoraConfig,
     AdaLoraModel,
@@ -19,27 +19,29 @@ from utils.prompter import Prompter
 import numpy as np
 import random
 import copy
+import bitsandbytes
+
 
 def fl_finetune(
         # model/data params
-        global_model: str = 'huggyllama/llama-7b',
-        data_path: str = './data',
-        output_dir: str = './fedgpt-llama7b-5-2/',
+        global_model: str = '/home/SHIH0020/FederatedLLM-main/FederatedLLM-main/base_model/llama3_8b',
+        data_path: str = '/home/SHIH0020/FederatedLLM-main/FederatedLLM-main/data_wiz',
+        output_dir: str = './FloRA-llama7b-wiz-homo/', # './fedgpt-llama7b-5-2/',
         # FL hyperparamas
         client_selection_strategy: str = 'random',
         client_selection_frac: float = 1,
-        num_communication_rounds: int = 5,
-        num_clients: int = 10,
+        num_communication_rounds: int = 3,
+        num_clients: int = 4,
         # Local training hyperparams
-        local_batch_size: int = 128,  # 64,
-        local_micro_batch_size: int = 16,
+        local_batch_size: int = 16,  # 64,
+        local_micro_batch_size: int = 4,
         local_num_epochs: int = 3,
         local_learning_rate: float = 3e-4,
         local_val_set_size: int = 0,
         local_save_steps: int = 3,
         cutoff_len: int = 512,
         # LoRA hyperparams
-        lora_r: int = 16,
+        lora_r: int = 1,
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
         lora_target_modules: List[str] = [
@@ -55,12 +57,12 @@ def fl_finetune(
         stacking: bool = False,
         # evaluation
         dev_data_path: str = './mmlu_test_1444.jsonl',
-        # heterogeneous
+        # heterogeneous or
         heter: bool = False,
         local_ranks: List[int] = [64, 32, 16, 16, 8, 8, 4, 4, 4, 4],
         zero_padding: bool = False,
         Adalora: bool = False,
-        full: bool = False
+        full: bool = False  #false聚合完整的模型参数，true聚合是 LoRA 适配层。
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -90,11 +92,12 @@ def fl_finetune(
         )
     assert (
         global_model
-    ), "Please specify a --global_model, e.g. --global_modell='decapoda-research/llama-7b-hf'"
-
+    ), "Please specify a --global_model, e.g. --global_modell='decapoda-research/llama-3b-hf'"
+    # print(data_path)
     data_path = os.path.join(data_path, str(num_clients))
-    assert (os.path.exists(data_path), "Please generate the data files for each client")
 
+    assert os.path.exists(data_path), "Please generate the data files for each client"
+###########################################################################################################
     # set up the global model & toknizer
     gradient_accumulation_steps = local_batch_size // local_micro_batch_size
     prompter = Prompter(prompt_template_name)
@@ -104,43 +107,44 @@ def fl_finetune(
     if ddp:
         device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
-
-    if global_model == 'gpt2':
-        model = GPT2LMHeadModel.from_pretrained(
-            global_model,
-            load_in_8bit=False,
-            torch_dtype=torch.float32,
-            device_map=device_map,
-        )
-    elif global_model == 'google/gemma-2b' or global_model == 'google/gemma-7b':
+####llama3—8b和deepseek
+    if global_model == '/home/SHIH0020/FederatedLLM-main/FederatedLLM-main/base_model/llama3_8b':
         model = AutoModelForCausalLM.from_pretrained(
             global_model,
-            load_in_8bit=False,
-            torch_dtype=torch.float32,
+            load_in_4bit=True,
+            #torch_dtype=torch.float32,
+            torch_dtype=torch.bfloat16,
             device_map=device_map,
             token='your token',
-        )
+    )
+    # elif global_model == 'google/gemma-2b' or global_model == 'google/gemma-7b':
+    #     model = AutoModelForCausalLM.from_pretrained(
+    #         global_model,
+    #         load_in_8bit=False,
+    #         torch_dtype=torch.float32,
+    #         device_map=device_map,
+    #         token='your token',
+        # )
+    
     else:
         model = LlamaForCausalLM.from_pretrained(
             global_model,
-            load_in_8bit=False,
-            torch_dtype=torch.float32,
+            load_in_4bit=True,
+            torch_dtype=torch.bfloat16,
             device_map=device_map,
             token="your token",
         )
 
-    if global_model == 'gpt2':
-        tokenizer = GPT2Tokenizer.from_pretrained(global_model)
-    elif global_model == 'google/gemma-2b' or global_model == 'google/gemma-7b':
+    # if global_model == 'gpt2':
+    #     tokenizer = GPT2Tokenizer.from_pretrained(global_model)
+    if global_model == '/home/SHIH0020/FederatedLLM-main/FederatedLLM-main/base_model/llama3_8b':
         tokenizer = AutoTokenizer.from_pretrained(global_model, token='your_token',)
     else:
         tokenizer = LlamaTokenizer.from_pretrained(global_model, token="your_token",)
 
-    tokenizer.pad_token_id = (
-        0
-    )
+    tokenizer.pad_token_id = (0)
     tokenizer.padding_side = "left"
-
+#数据预处理，添加eos token 
     def tokenize(prompt, add_eos_token=True):
         result = tokenizer(
             prompt,
@@ -150,7 +154,7 @@ def fl_finetune(
             return_tensors=None,
         )
         if (
-                result["input_ids"][-1] != tokenizer.eos_token_id
+                result["input_ids"][-1] != tokenizer.eos_token_id     #末尾不是eos的添加eos
                 and len(result["input_ids"]) < cutoff_len
                 and add_eos_token
         ):
@@ -160,15 +164,21 @@ def fl_finetune(
         result["labels"] = result["input_ids"].copy()
 
         return result
-
+#分词。
     def generate_and_tokenize_prompt(data_point):
+        ##################################
+        # print("Data Point:", data_point)  
+        # print("Data Point Keys:", data_point.keys())  
+        # return tokenizer(data_point["input"]) 
+    
+        ######
         if data_path == './data/10':
             full_prompt = prompter.generate_prompt(
                 data_point["instruction"],
                 data_point["context"],
                 data_point["response"],
             )
-        elif data_path == './data_wiz/10' or data_path == './data_mix/20':
+        elif data_path == '/home/SHIH0020/FederatedLLM-main/FederatedLLM-main/data_wiz/4' or data_path == './data_mix/20':
             full_prompt = prompter.generate_prompt(
                 data_point["instruction"],
                 None,
@@ -235,6 +245,11 @@ def fl_finetune(
     if not ddp and torch.cuda.device_count() > 1:
         model.is_parallelizable = True
         model.model_parallel = True
+        # model.is_fsdp_enabled = True  # 允许 Fully Sharded Data Parallel (FSDP)
+        # model = torch.nn.parallel.DistributedDataParallel(
+        #     model,
+        #     device_ids=[torch.cuda.current_device()]
+        # )
 
     print("The process of federated instruction-tuning has started..")
     previously_selected_clients_set = set()
@@ -243,8 +258,8 @@ def fl_finetune(
     output_dir = os.path.join(output_dir, str(num_clients))
 
     acc_list = []
-
-    for epoch in tqdm(range(num_communication_rounds)):
+#federated learning training
+    for epoch in tqdm(range(num_communication_rounds)):   #进度条
 
         print("\nConducting the client selection")
         selected_clients_set = client_selection(num_clients, client_selection_frac, client_selection_strategy,
